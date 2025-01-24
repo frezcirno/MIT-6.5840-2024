@@ -198,7 +198,7 @@ type Raft struct {
 	nextIndex  []int
 	matchIndex []int
 
-	applying int32
+	pendingSnapshot *ApplyMsg
 	// If true, use asynchronous InstallSnapshot
 	// Asynchronous InstallSnapshot is faster but cannot pass lab 3D test
 	// Lab 3D test requires the service to switch to the snapshot immediately
@@ -396,11 +396,8 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 
 	if !rf.useAsyncInstallSnapshot {
 		rf.doInstallSnapshot(args.LastIncludedTerm, args.LastIncludedIndex, args.Data)
-		for atomic.LoadInt32(&rf.applying) > 0 {
-			// wait for old logs to be applied
-			time.Sleep(1 * time.Millisecond)
-		}
-		rf.applyCh <- ApplyMsg{
+		// overwrite is ok
+		rf.pendingSnapshot = &ApplyMsg{
 			SnapshotValid: true,
 			Snapshot:      args.Data,
 			SnapshotTerm:  args.LastIncludedTerm,
@@ -861,8 +858,17 @@ func (rf *Raft) replicateByIS(i int, args *InstallSnapshotArgs) {
 		return
 	}
 
+	// outdated InstallSnapshot response
+	if args.LastIncludedIndex <= rf.matchIndex[i] {
+		return
+	}
+
+	if args.LastIncludedIndex+1 > rf.nextIndex[i] {
+		rf.nextIndex[i] = args.LastIncludedIndex + 1
+		assert_le(rf.nextIndex[i], rf.nextLogIndex(), "nextIndex > nextLogIndex")
+	}
+
 	rf.matchIndex[i] = args.LastIncludedIndex
-	rf.nextIndex[i] = args.LastIncludedIndex + 1
 	rf.updateCommitIndex()
 }
 
@@ -933,12 +939,6 @@ func (rf *Raft) replicateByAE(i int, args *AppendEntriesArgs, nextIndex int) {
 	}
 }
 
-func copySlice(entries []LogEntry) []LogEntry {
-	newEntries := make([]LogEntry, len(entries))
-	copy(newEntries, entries)
-	return newEntries
-}
-
 func (rf *Raft) replicateTo(i int) {
 	rf.mu.RLock()
 	if !rf.leader {
@@ -947,7 +947,7 @@ func (rf *Raft) replicateTo(i int) {
 	}
 
 	nextIndex := rf.nextIndex[i]
-	if nextIndex < rf.firstLogIndex() {
+	if nextIndex <= rf.prevLogIndex() {
 		assert_gt(len(rf.persister.ReadSnapshot()), 0, "snapshot is empty")
 		args := &InstallSnapshotArgs{
 			Term:              rf.currentTerm,
@@ -961,13 +961,16 @@ func (rf *Raft) replicateTo(i int) {
 		rf.replicateByIS(i, args)
 	} else {
 		assert_le(rf.commitIndex, rf.lastLogIndex(), "commitIndex > lastLogIndex")
+		// copy to avoid data race
+		logs := rf.getLogFrom(nextIndex)
+		logs_copy := make([]LogEntry, len(logs))
+		copy(logs_copy, logs)
 		args := &AppendEntriesArgs{
 			Term:         rf.currentTerm,
 			LeaderId:     rf.me,
 			PrevLogIndex: nextIndex - 1,
 			PrevLogTerm:  rf.getLogTerm(nextIndex - 1),
-			// copy to avoid data race
-			Entries:      copySlice(rf.getLogFrom(nextIndex)), // not include the dummy log
+			Entries:      logs_copy, // not include the dummy log
 			LeaderCommit: rf.commitIndex,
 		}
 		rf.mu.RUnlock()
@@ -995,18 +998,25 @@ func (rf *Raft) applier() {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	for !rf.killed() {
-		if rf.lastApplied < rf.commitIndex {
+		if rf.pendingSnapshot != nil {
+			// apply snapshot
+			snapshot := rf.pendingSnapshot
+			rf.pendingSnapshot = nil
+			rf.mu.Unlock()
+			// log.Printf("[raft-%s%d] [apply snapshot] to log[:%d]", rf.tag, rf.me, rf.pendingSnapshot.SnapshotIndex)
+			rf.applyCh <- *snapshot
+			rf.mu.Lock()
+		} else if rf.lastApplied < rf.commitIndex {
 			// apply logs
 			assert_gt(rf.commitIndex, rf.lastApplied, "commitIndex <= lastApplied")
 			assert_le(rf.commitIndex, rf.lastLogIndex(), "commitIndex > lastLogIndex")
 			assert_ge(rf.lastApplied, rf.prevLogIndex(), "lastApplied < prevLogIndex")
 
-			startIndex := rf.lastApplied + 1
 			// log.Printf("[raft-%s%d] [apply async] log[%d:%d]", rf.tag, rf.me, startIndex, rf.commitIndex+1)
+			startIndex := rf.lastApplied + 1
 			entries := append([]LogEntry{}, rf.getLogSlice(startIndex, rf.commitIndex+1)...)
 			rf_commitIndex := rf.commitIndex
 			rf.mu.Unlock()
-			atomic.StoreInt32(&rf.applying, 1)
 			for i, entry := range entries {
 				rf.applyCh <- ApplyMsg{
 					CommandValid: true,
@@ -1015,8 +1025,8 @@ func (rf *Raft) applier() {
 					CommandIndex: startIndex + i,
 				}
 			}
-			atomic.StoreInt32(&rf.applying, 0)
 			rf.mu.Lock()
+			// rf.commitIndex may rollback because of a snapshot
 			rf.lastApplied = Max(rf.lastApplied, rf_commitIndex)
 		} else {
 			// wait
@@ -1071,7 +1081,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.nextIndex = make([]int, len(peers))
 	rf.matchIndex = make([]int, len(peers))
 
-	rf.applying = 0
+	rf.pendingSnapshot = nil
 	rf.useAsyncInstallSnapshot = false
 	rf.tag = ""
 
